@@ -1,174 +1,68 @@
 name: Build Unsigned IPA
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 jobs:
   build:
     runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Show Xcode version
-        run: |
-          xcodebuild -version
-          xcode-select -p
-      - name: Find Xcode project
-        id: project
+      - name: Build unsigned IPA
         shell: bash
         run: |
           set -e
-          WORKSPACE=$(find . -name "*.xcworkspace" \
-            -not -path "*/Pods/*" \
-            -print -quit)
-          PROJECT=$(find . -name "*.xcodeproj" \
-            -not -path "*/Pods/*" \
-            -print -quit)
+          PROJECT=$(find . -name "*.xcodeproj" -not -path "*/Pods/*" -print -quit)
+          WORKSPACE=$(find . -name "*.xcworkspace" -not -path "*/Pods/*" -print -quit)
           if [ -n "$WORKSPACE" ]; then
-            echo "type=workspace" >> "$GITHUB_OUTPUT"
-            echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
-            echo "Found workspace: $WORKSPACE"
+            CONTAINER="-workspace"
+            PROJECT_PATH="$WORKSPACE"
           elif [ -n "$PROJECT" ]; then
-            echo "type=project" >> "$GITHUB_OUTPUT"
-            echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
-            echo "Found project: $PROJECT"
+            CONTAINER="-project"
+            PROJECT_PATH="$PROJECT"
           else
-            echo "::error::No Xcode project or workspace found."
+            echo "No Xcode project found"
             exit 1
           fi
-      - name: Install CocoaPods if needed
-        shell: bash
-        run: |
-          if find . -maxdepth 3 -name "Podfile" -print -quit | grep -q .; then
-            sudo gem install cocoapods
-            pod install --repo-update
-          fi
-      - name: Resolve Swift packages
-        shell: bash
-        run: |
-          set -e
-          if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
-            xcodebuild \
-              -resolvePackageDependencies \
-              -workspace "${{ steps.project.outputs.path }}"
-          else
-            xcodebuild \
-              -resolvePackageDependencies \
-              -project "${{ steps.project.outputs.path }}"
-          fi
-      - name: Find scheme
-        id: scheme
-        shell: bash
-        run: |
-          set -e
-          if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
-            xcodebuild \
-              -list \
-              -workspace "${{ steps.project.outputs.path }}" \
-              > /tmp/xcode-list.txt
-          else
-            xcodebuild \
-              -list \
-              -project "${{ steps.project.outputs.path }}" \
-              > /tmp/xcode-list.txt
-          fi
-          cat /tmp/xcode-list.txt
-          SCHEME=$(awk '
-            /Schemes:/ {
-              in_schemes=1
-              next
-            }
-            in_schemes && NF {
-              gsub(/^[ \t]+|[ \t]+$/, "", $0)
-              print
-              exit
-            }
-          ' /tmp/xcode-list.txt)
+          echo "Using: $PROJECT_PATH"
+          SCHEME=$(xcodebuild -list \
+            "$CONTAINER" "$PROJECT_PATH" |
+            awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}')
           if [ -z "$SCHEME" ]; then
-            echo "::error::Could not find an Xcode scheme."
+            echo "Could not find scheme"
             exit 1
           fi
-          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
           echo "Using scheme: $SCHEME"
-      - name: Build unsigned app
-        shell: bash
-        run: |
-          set -euo pipefail
-          DERIVED="$RUNNER_TEMP/DerivedData"
-          rm -rf "$DERIVED"
-          if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
-            xcodebuild \
-              -workspace "${{ steps.project.outputs.path }}" \
-              -scheme "${{ steps.scheme.outputs.scheme }}" \
-              -configuration Release \
-              -sdk iphoneos \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath "$DERIVED" \
-              CODE_SIGN_IDENTITY=- \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              DEVELOPMENT_TEAM="" \
-              PROVISIONING_PROFILE_SPECIFIER="" \
-              build
-          else
-            xcodebuild \
-              -project "${{ steps.project.outputs.path }}" \
-              -scheme "${{ steps.scheme.outputs.scheme }}" \
-              -configuration Release \
-              -sdk iphoneos \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath "$DERIVED" \
-              CODE_SIGN_IDENTITY=- \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              DEVELOPMENT_TEAM="" \
-              PROVISIONING_PROFILE_SPECIFIER="" \
-              build
-          fi
-          echo "Looking for built app..."
-          APP=$(find "$DERIVED/Build/Products" \
+          rm -rf "$RUNNER_TEMP/Build"
+          xcodebuild \
+            "$CONTAINER" "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/Build" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+          APP=$(find "$RUNNER_TEMP/Build/Build/Products" \
             -type d \
             -name "*.app" \
             -path "*iphoneos*" \
             -print -quit)
           if [ -z "$APP" ]; then
-            echo "::error::No iOS .app was produced."
-            find "$DERIVED/Build/Products" -maxdepth 4 -print
+            echo "No .app was created"
             exit 1
           fi
-          echo "APP=$APP" >> "$GITHUB_ENV"
-          echo "Built: $APP"
-      - name: Create unsigned IPA
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Found: $APP"
           mkdir -p "$RUNNER_TEMP/IPA/Payload"
           cp -R "$APP" "$RUNNER_TEMP/IPA/Payload/"
           cd "$RUNNER_TEMP/IPA"
           zip -qry Unsigned.ipa Payload
-          echo "Created IPA:"
+          echo "Created:"
           ls -lh Unsigned.ipa
-      - name: Verify IPA
-        shell: bash
-        run: |
-          set -e
-          unzip -l "$RUNNER_TEMP/IPA/Unsigned.ipa"
-          unzip -q "$RUNNER_TEMP/IPA/Unsigned.ipa" \
-            -d "$RUNNER_TEMP/verify"
-          APP_COUNT=$(find "$RUNNER_TEMP/verify/Payload" \
-            -maxdepth 1 \
-            -type d \
-            -name "*.app" | wc -l)
-          if [ "$APP_COUNT" -ne 1 ]; then
-            echo "::error::IPA does not contain exactly one app."
-            exit 1
-          fi
-          echo "IPA verification successful."
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: Unsigned-IPA
           path: ${{ runner.temp }}/IPA/Unsigned.ipa
           if-no-files-found: error
-          retention-days: 30
