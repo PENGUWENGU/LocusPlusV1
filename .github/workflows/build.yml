@@ -7,58 +7,108 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Build unsigned IPA
+      - name: Install dependencies
         shell: bash
         run: |
           set -e
-          PROJECT=$(find . -name "*.xcodeproj" -not -path "*/Pods/*" -print -quit)
-          WORKSPACE=$(find . -name "*.xcworkspace" -not -path "*/Pods/*" -print -quit)
+          if [ -f "Podfile" ]; then
+            sudo gem install cocoapods --no-document
+            pod install
+          fi
+      - name: Locate project
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          WORKSPACE=$(find . -name "*.xcworkspace" \
+            -not -path "*/Pods/*" \
+            -print -quit)
+          PROJECT=$(find . -name "*.xcodeproj" \
+            -not -path "*/Pods/*" \
+            -print -quit)
           if [ -n "$WORKSPACE" ]; then
-            CONTAINER="-workspace"
-            PROJECT_PATH="$WORKSPACE"
+            echo "kind=workspace" >> "$GITHUB_OUTPUT"
+            echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+            echo "Using workspace: $WORKSPACE"
           elif [ -n "$PROJECT" ]; then
-            CONTAINER="-project"
-            PROJECT_PATH="$PROJECT"
+            echo "kind=project" >> "$GITHUB_OUTPUT"
+            echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
+            echo "Using project: $PROJECT"
           else
-            echo "No Xcode project found"
+            echo "::error::No Xcode project/workspace found."
             exit 1
           fi
-          echo "Using: $PROJECT_PATH"
-          SCHEME=$(xcodebuild -list \
-            "$CONTAINER" "$PROJECT_PATH" |
-            awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}')
-          if [ -z "$SCHEME" ]; then
-            echo "Could not find scheme"
-            exit 1
+      - name: List schemes
+        shell: bash
+        run: |
+          if [ "${{ steps.locate.outputs.kind }}" = "workspace" ]; then
+            xcodebuild -list \
+              -workspace "${{ steps.locate.outputs.path }}"
+          else
+            xcodebuild -list \
+              -project "${{ steps.locate.outputs.path }}"
           fi
-          echo "Using scheme: $SCHEME"
-          rm -rf "$RUNNER_TEMP/Build"
-          xcodebuild \
-            "$CONTAINER" "$PROJECT_PATH" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "$RUNNER_TEMP/Build" \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-          APP=$(find "$RUNNER_TEMP/Build/Build/Products" \
+      - name: Build unsigned app
+        shell: bash
+        run: |
+          set -o pipefail
+          BUILD_DIR="$RUNNER_TEMP/Build"
+          rm -rf "$BUILD_DIR"
+          if [ "${{ steps.locate.outputs.kind }}" = "workspace" ]; then
+            xcodebuild \
+              -workspace "${{ steps.locate.outputs.path }}" \
+              -scheme "$(basename "${{ steps.locate.outputs.path }}" .xcworkspace)" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$BUILD_DIR" \
+              -skipPackagePluginValidation \
+              -skipMacroValidation \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              build
+          else
+            xcodebuild \
+              -project "${{ steps.locate.outputs.path }}" \
+              -scheme "$(basename "${{ steps.locate.outputs.path }}" .xcodeproj)" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$BUILD_DIR" \
+              -skipPackagePluginValidation \
+              -skipMacroValidation \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              build
+          fi
+          APP=$(find "$BUILD_DIR/Build/Products" \
             -type d \
             -name "*.app" \
             -path "*iphoneos*" \
             -print -quit)
           if [ -z "$APP" ]; then
-            echo "No .app was created"
+            echo "::error::Build completed but no .app was found."
+            find "$BUILD_DIR" -type d -name "*.app" -print
             exit 1
           fi
-          echo "Found: $APP"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "Found app: $APP"
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -e
           mkdir -p "$RUNNER_TEMP/IPA/Payload"
           cp -R "$APP" "$RUNNER_TEMP/IPA/Payload/"
           cd "$RUNNER_TEMP/IPA"
-          zip -qry Unsigned.ipa Payload
-          echo "Created:"
+          /usr/bin/zip -qry Unsigned.ipa Payload
+          test -f Unsigned.ipa
+          echo "IPA successfully created:"
           ls -lh Unsigned.ipa
       - name: Upload IPA
         uses: actions/upload-artifact@v4
@@ -66,3 +116,4 @@ jobs:
           name: Unsigned-IPA
           path: ${{ runner.temp }}/IPA/Unsigned.ipa
           if-no-files-found: error
+          retention-days: 30
