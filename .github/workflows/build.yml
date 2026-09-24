@@ -1,0 +1,152 @@
+name: Build unsigned IPA
+
+# Manually triggered only (Actions tab -> "Build unsigned IPA" -> "Run workflow").
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Build configuration"
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      build_number:
+        description: "Optional CFBundleVersion / CURRENT_PROJECT_VERSION override (leave blank to keep the value in project.yml)"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build-unsigned-ipa:
+    # Locus/Support/Theme.swift uses the Liquid Glass APIs (Glass, .glassEffect) behind
+    # `#available(iOS 26.0, *)`. Those are real symbols introduced in the iOS 26 SDK, so
+    # this project needs an Xcode 26+ toolchain to compile at all - which in turn needs a
+    # macOS 26 (Tahoe) host. Do not change this to an older `macos-*` label; Xcode 26/27
+    # cannot run on macOS 15 or earlier runners.
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          # Always the newest non-beta Xcode already on the runner, so this keeps working
+          # as GitHub's macos-26 image moves forward without needing a version bump here.
+          xcode-version: latest-stable
+
+      - name: Show Xcode/SDK versions in use
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project from project.yml
+        run: xcodegen generate
+
+      - name: Pick an available iOS Simulator destination for tests
+        id: sim
+        run: |
+          set -euo pipefail
+          DEST_LINE=$(xcodebuild -showdestinations -project Locus.xcodeproj -scheme LocusTests 2>/dev/null \
+            | grep "platform:iOS Simulator" | grep "OS:" | head -1 || true)
+          if [ -z "$DEST_LINE" ]; then
+            echo "::error::No iOS Simulator destination is available on this runner for LocusTests."
+            exit 1
+          fi
+          echo "Found destination: $DEST_LINE"
+          DEVICE_NAME=$(echo "$DEST_LINE" | sed -E 's/.*name:([^,}]+).*/\1/')
+          echo "device_name=${DEVICE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests (LocusTests)
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project Locus.xcodeproj \
+            -scheme LocusTests \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee test.log
+
+      - name: Build unsigned app (Locus, generic iOS device)
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${BUILD_NUMBER}" ]; then
+            EXTRA_ARGS+=("CURRENT_PROJECT_VERSION=${BUILD_NUMBER}")
+          fi
+          xcodebuild \
+            -project Locus.xcodeproj \
+            -scheme Locus \
+            -configuration "${CONFIGURATION}" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "${GITHUB_WORKSPACE}/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            "${EXTRA_ARGS[@]}" \
+            clean build 2>&1 | tee build.log
+
+      - name: Locate Locus.app
+        id: app
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find "${GITHUB_WORKSPACE}/build/Build/Products" -maxdepth 2 -iname "Locus.app" -type d | head -1)
+          if [ -z "${APP_PATH}" ]; then
+            echo "::error::Locus.app was not found under build/Build/Products after building. See build.log."
+            exit 1
+          fi
+          echo "Found app bundle: ${APP_PATH}"
+          echo "app_path=${APP_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          STAGE="${GITHUB_WORKSPACE}/ipa_staging"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}/Payload"
+          cp -R "${{ steps.app.outputs.app_path }}" "${STAGE}/Payload/Locus.app"
+          # ditto (rather than plain zip) preserves the app bundle's permissions and
+          # resource forks the way Apple's own tooling expects for an IPA.
+          ditto -c -k --sequesterRsrc --keepParent "${STAGE}/Payload" "${GITHUB_WORKSPACE}/LocusPlus-unsigned.ipa"
+
+      - name: Verify the IPA contents
+        run: |
+          set -euo pipefail
+          if ! unzip -l "${GITHUB_WORKSPACE}/LocusPlus-unsigned.ipa" | grep -q "Payload/Locus.app/Locus$"; then
+            echo "::error::LocusPlus-unsigned.ipa does not contain Payload/Locus.app/Locus. Packaging failed."
+            unzip -l "${GITHUB_WORKSPACE}/LocusPlus-unsigned.ipa" || true
+            exit 1
+          fi
+          echo "Verified: Payload/Locus.app/Locus is present."
+          ls -lh "${GITHUB_WORKSPACE}/LocusPlus-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocusPlus-unsigned
+          path: LocusPlus-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build/test logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore
+          retention-days: 14
