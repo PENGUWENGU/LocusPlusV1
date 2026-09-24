@@ -6,17 +6,25 @@ on:
       - main
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcode-select -p
       - name: Find Xcode project
         id: project
         shell: bash
         run: |
           set -e
-          PROJECT=$(find . -maxdepth 3 -name "*.xcodeproj" -print -quit)
-          WORKSPACE=$(find . -maxdepth 3 -name "*.xcworkspace" -print -quit)
+          WORKSPACE=$(find . -name "*.xcworkspace" \
+            -not -path "*/Pods/*" \
+            -print -quit)
+          PROJECT=$(find . -name "*.xcodeproj" \
+            -not -path "*/Pods/*" \
+            -print -quit)
           if [ -n "$WORKSPACE" ]; then
             echo "type=workspace" >> "$GITHUB_OUTPUT"
             echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
@@ -26,8 +34,28 @@ jobs:
             echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
             echo "Found project: $PROJECT"
           else
-            echo "::error::No .xcodeproj or .xcworkspace found."
+            echo "::error::No Xcode project or workspace found."
             exit 1
+          fi
+      - name: Install CocoaPods if needed
+        shell: bash
+        run: |
+          if find . -maxdepth 3 -name "Podfile" -print -quit | grep -q .; then
+            sudo gem install cocoapods
+            pod install --repo-update
+          fi
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
+            xcodebuild \
+              -resolvePackageDependencies \
+              -workspace "${{ steps.project.outputs.path }}"
+          else
+            xcodebuild \
+              -resolvePackageDependencies \
+              -project "${{ steps.project.outputs.path }}"
           fi
       - name: Find scheme
         id: scheme
@@ -35,28 +63,40 @@ jobs:
         run: |
           set -e
           if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
-            LIST=$(xcodebuild -list -workspace "${{ steps.project.outputs.path }}")
+            xcodebuild \
+              -list \
+              -workspace "${{ steps.project.outputs.path }}" \
+              > /tmp/xcode-list.txt
           else
-            LIST=$(xcodebuild -list -project "${{ steps.project.outputs.path }}")
+            xcodebuild \
+              -list \
+              -project "${{ steps.project.outputs.path }}" \
+              > /tmp/xcode-list.txt
           fi
-          echo "$LIST"
-          SCHEME=$(echo "$LIST" |
-            awk '
-              /Schemes:/ {found=1; next}
-              found && NF {print; exit}
-            ' |
-            sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          cat /tmp/xcode-list.txt
+          SCHEME=$(awk '
+            /Schemes:/ {
+              in_schemes=1
+              next
+            }
+            in_schemes && NF {
+              gsub(/^[ \t]+|[ \t]+$/, "", $0)
+              print
+              exit
+            }
+          ' /tmp/xcode-list.txt)
           if [ -z "$SCHEME" ]; then
-            echo "::error::Could not automatically find an Xcode scheme."
+            echo "::error::Could not find an Xcode scheme."
             exit 1
           fi
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
           echo "Using scheme: $SCHEME"
-      - name: Build unsigned archive
+      - name: Build unsigned app
         shell: bash
         run: |
           set -euo pipefail
-          ARCHIVE="$RUNNER_TEMP/Unsigned.xcarchive"
+          DERIVED="$RUNNER_TEMP/DerivedData"
+          rm -rf "$DERIVED"
           if [ "${{ steps.project.outputs.type }}" = "workspace" ]; then
             xcodebuild \
               -workspace "${{ steps.project.outputs.path }}" \
@@ -64,13 +104,13 @@ jobs:
               -configuration Release \
               -sdk iphoneos \
               -destination "generic/platform=iOS" \
-              -archivePath "$ARCHIVE" \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGNING_REQUIRED=NO \
+              -derivedDataPath "$DERIVED" \
+              CODE_SIGN_IDENTITY=- \
               CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
               DEVELOPMENT_TEAM="" \
               PROVISIONING_PROFILE_SPECIFIER="" \
-              archive
+              build
           else
             xcodebuild \
               -project "${{ steps.project.outputs.path }}" \
@@ -78,64 +118,57 @@ jobs:
               -configuration Release \
               -sdk iphoneos \
               -destination "generic/platform=iOS" \
-              -archivePath "$ARCHIVE" \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGNING_REQUIRED=NO \
+              -derivedDataPath "$DERIVED" \
+              CODE_SIGN_IDENTITY=- \
               CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
               DEVELOPMENT_TEAM="" \
               PROVISIONING_PROFILE_SPECIFIER="" \
-              archive
+              build
           fi
-          test -d "$ARCHIVE"
-          echo "Archive created:"
-          find "$ARCHIVE/Products" -maxdepth 3 -type d -name "*.app" -print
-      - name: Package unsigned IPA
+          echo "Looking for built app..."
+          APP=$(find "$DERIVED/Build/Products" \
+            -type d \
+            -name "*.app" \
+            -path "*iphoneos*" \
+            -print -quit)
+          if [ -z "$APP" ]; then
+            echo "::error::No iOS .app was produced."
+            find "$DERIVED/Build/Products" -maxdepth 4 -print
+            exit 1
+          fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "Built: $APP"
+      - name: Create unsigned IPA
         shell: bash
         run: |
           set -euo pipefail
-          ARCHIVE="$RUNNER_TEMP/Unsigned.xcarchive"
-          OUTPUT="$RUNNER_TEMP/ipa"
-          rm -rf "$OUTPUT"
-          mkdir -p "$OUTPUT/Payload"
-          APP=$(find "$ARCHIVE/Products/Applications" \
-            -maxdepth 1 \
-            -type d \
-            -name "*.app" \
-            -print -quit)
-          if [ -z "$APP" ]; then
-            echo "::error::No .app found in the archive."
-            exit 1
-          fi
-          echo "Found app:"
-          echo "$APP"
-          cp -R "$APP" "$OUTPUT/Payload/"
-          cd "$OUTPUT"
-          zip -qry "Unsigned.ipa" Payload
-          test -f "Unsigned.ipa"
-          echo "IPA created:"
-          ls -lh "Unsigned.ipa"
-      - name: Verify IPA structure
+          mkdir -p "$RUNNER_TEMP/IPA/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/IPA/Payload/"
+          cd "$RUNNER_TEMP/IPA"
+          zip -qry Unsigned.ipa Payload
+          echo "Created IPA:"
+          ls -lh Unsigned.ipa
+      - name: Verify IPA
         shell: bash
         run: |
-          set -euo pipefail
-          unzip -l "$RUNNER_TEMP/ipa/Unsigned.ipa"
-          unzip -q "$RUNNER_TEMP/ipa/Unsigned.ipa" \
-            -d "$RUNNER_TEMP/ipa_check"
-          APP=$(find "$RUNNER_TEMP/ipa_check/Payload" \
+          set -e
+          unzip -l "$RUNNER_TEMP/IPA/Unsigned.ipa"
+          unzip -q "$RUNNER_TEMP/IPA/Unsigned.ipa" \
+            -d "$RUNNER_TEMP/verify"
+          APP_COUNT=$(find "$RUNNER_TEMP/verify/Payload" \
             -maxdepth 1 \
             -type d \
-            -name "*.app" \
-            -print -quit)
-          if [ -z "$APP" ]; then
-            echo "::error::IPA does not contain Payload/*.app"
+            -name "*.app" | wc -l)
+          if [ "$APP_COUNT" -ne 1 ]; then
+            echo "::error::IPA does not contain exactly one app."
             exit 1
           fi
-          echo "IPA structure is valid."
-          echo "App: $APP"
-      - name: Upload unsigned IPA
+          echo "IPA verification successful."
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: unsigned-ipa
-          path: ${{ runner.temp }}/ipa/Unsigned.ipa
+          name: Unsigned-IPA
+          path: ${{ runner.temp }}/IPA/Unsigned.ipa
           if-no-files-found: error
           retention-days: 30
